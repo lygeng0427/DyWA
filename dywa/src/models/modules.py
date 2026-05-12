@@ -573,11 +573,9 @@ class HistoryEncoder(nn.Module):
     def put_history(self, tensor: th.Tensor):
         assert tensor.shape[1] == self.num_tokens
 
-        buffer = getattr(self, 'history')
-        buffer = th.concat([buffer[:, 1:], tensor.detach().unsqueeze(1)], dim= 1)
+        buffer[:, :-1].copy_(buffer[:, 1:].clone())
+        buffer[:, -1].copy_(tensor.detach())
         return buffer
-        # buffer[:, :-1] = buffer[:, 1:].clone()  
-        # buffer[:, -1] = tensor.detach()  
     
     def forward(self, cur_obs):
 
