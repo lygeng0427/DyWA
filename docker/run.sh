@@ -3,10 +3,10 @@
 set -exu
 
 # CONFIGURE DATA PATHS (please modify according to your environment)
-IG_PATH="/path/to/isaacgym"
-CACHE_PATH="/path/to/.cache"
-DATA_PATH="/path/to/data"
-TMP_PATH="/path/to/tmp"
+IG_PATH="/home/liyuan/DyWA/isaacgym/isaacgym"  # Path to Isaac Gym (the one with `python` folder)
+CACHE_PATH="/home/liyuan/.cache/dywa"
+DATA_PATH="/home/liyuan/DyWA/datasets"
+TMP_PATH="/home/liyuan/tmp"
 
 # Figure out repository root.
 SCRIPT_DIR="$( cd "$( dirname $(realpath "${BASH_SOURCE[0]}") )" && pwd )"

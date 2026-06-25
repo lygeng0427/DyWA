@@ -79,7 +79,7 @@ def last_ckpt(root: Union[str, PathLike, Path],
 
     # By default, sort by file modification time.
     if key is None:
-        lambda f: f.stat().st_mtime
+        key = lambda f: f.stat().st_mtime
 
     path = Path(root)
     if path.is_file():

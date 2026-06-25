@@ -1,4 +1,14 @@
 #!/bin/bash
+# Record success + failure rollout mp4 videos for the held-out (TEST) can and
+# bottle instances. Runs the same student/teacher DAgger eval as
+# eval_student_unseen_obj.sh, but:
+#   * restricts the object set to the test can+bottle (can_bottle_test.json)
+#   * wraps the env with NvdrRecordEpisode (episode_type=both)
+#
+# Output mp4s land under <record_dir>/{succ,fail}/env_XXXX/episode_*_<objkey>.mp4
+# so each clip is tagged with its object key (can/bottle + scale).
+#
+# MUST be run inside the DyWA Docker container (needs Isaac Gym).
 cd /home/user/DyWA/dywa/exp/train
 
 export PYTHONPATH=/opt/isaacgym/python:/home/user/DyWA:$PYTHONPATH
@@ -7,12 +17,11 @@ mkdir -p "$TORCH_EXTENSIONS_DIR"
 
 name='dywa'
 root="/home/user/DyWA/output/test_rma"
+record_dir="${root}/${name}/rollouts/can_bottle"
 
 GPU=${1:-0}
 
-if [ ! -d "${root}/${name}" ]; then
-mkdir -p "${root}/${name}"
-fi
+mkdir -p "$record_dir"
 
 PYTORCH_JIT=0 python3 test_rma.py \
 +platform=debug \
@@ -21,7 +30,7 @@ PYTORCH_JIT=0 python3 test_rma.py \
 +student=dywa/base \
 ++name="$name" \
 ++path.root="${root}/${name}" \
-++env.num_env=60 \
+++env.num_env=12 \
 ++global_device=cuda:${GPU} \
 ++student.norm="ln" \
 +load_student=/input/pretrained/Dywa_abs_1view/ckpt/last.ckpt \
@@ -31,8 +40,11 @@ PYTORCH_JIT=0 python3 test_rma.py \
 ++dagger_train_env.anneal_step=1 \
 ++add_teacher_state=1 \
 ++student.decoder.film_mlp=1 \
-++env.single_object_scene.filter_file=/input/DGN/test_set.json \
-++monitor.num_env_record=60 \
+++env.single_object_scene.filter_file=/input/DGN/can_bottle_test.json \
 ++env.single_object_scene.mode=valid \
 ++log_categorical_results=True \
-# &> "$root/$name/out.out"
+++record_episode=True \
+++record_episode_cfg.episode_type=both \
+++record_episode_cfg.record_dir="${record_dir}" \
+++test_step=3000 \
+# &> "$root/$name/record.out"

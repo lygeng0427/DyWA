@@ -17,7 +17,7 @@ from env.env.wrap.base import (ObservationWrapper,
 from omegaconf import OmegaConf
 from env.env.wrap.record_viewer import RecordViewer
 # from env.env.wrap.nvdr_record_viewer import NvdrRecordViewer
-# from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
+from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
 from envs.cube_env_wrappers import (CountCategoricalSuccess,
                                     ScenarioTest
                                     )
@@ -102,6 +102,17 @@ class Config(RMAConfig):
     log_episode: LogEpisodes.Config = LogEpisodes.Config()
     sync_frame_time: bool = False
     test_scenario: bool = False
+
+    # Record per-episode mp4 rollouts (success/failure). Only active on the
+    # DAgger eval path, where the env exposes the standard step(action) contract.
+    record_episode: bool = False
+    record_episode_cfg: NvdrRecordEpisode.Config = NvdrRecordEpisode.Config()
+
+    # Object-gallery rendering (render_train_objects.py): one scene image per
+    # object in the filtered set.
+    gallery_dir: Optional[str] = None
+    gallery_max_steps: int = 1500
+    gallery_settle: int = 25
 
     student: StudentAgentRMA.StudentAgentRMAConfig = (
         # StudentAgentRMA.StudentAgentRMAConfig()
@@ -357,11 +368,16 @@ def main(cfg: Config):
     else:
         export_cfg()
 
+        # Wrap with the episode recorder *inside* DAgger so the recorder keeps
+        # the standard step(action) -> (obs, rew, done, info) contract.
+        if cfg.record_episode:
+            env = NvdrRecordEpisode(cfg.record_episode_cfg, env)
+
         if cfg.dagger:
             env = DAggerTrainerEnv(
                 # DAggerTrainerEnv.Config(
                 #     alpha0=1.0,
-                #     alpha1=1.0, 
+                #     alpha1=1.0,
                 #     anneal_step=1),
                 cfg.dagger_train_env,
                 env, student)

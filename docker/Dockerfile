@@ -212,8 +212,9 @@ ENV TORCH_CUDA_ARCH_LIST='Ampere'
 #     torch-points3d
 
 # Install `nvdiffrast` for fast mesh rasterization.
-RUN python3 -m pip install --upgrade \
-    git+https://bgithub.xyz/NVlabs/nvdiffrast.git
+RUN python3 -m pip install --upgrade setuptools wheel ninja && \
+    python3 -m pip install --upgrade \
+    git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
 
 # Install PySDF for signed-distance function generations.
 # Install torchmcubes for visualization.
@@ -234,7 +235,7 @@ RUN python3 -m pip install --upgrade \
 RUN python3 -m pip install --upgrade \
     line_profiler \
     cachetools \
-    nvtx
+    nvtx==0.2.6
 
 # Dataset ...
 RUN python3 -m pip install --upgrade \
@@ -247,7 +248,7 @@ RUN python3 -m pip install --upgrade \
 #    . &&\
 #    cd $HOME
 RUN python3 -m pip install --upgrade \
-    git+https://bgithub.xyz/ir413/mvp
+    git+https://github.com/ir413/mvp
 
 # Upgrade Open3D for visualization
 RUN python3 -m pip install open3d --upgrade
@@ -273,7 +274,7 @@ RUN python3 -m pip install --upgrade \
 # Extra packages for training scripts
 RUN python3 -m pip install --upgrade numpy
 # For pretraining
-RUN python3 -m pip install git+https://bgithub.xyz/katsura-jp/pytorch-cosine-annealing-with-warmup
+RUN python3 -m pip install git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup
 # For policy training
 RUN python3 -m pip install --upgrade opt_einsum coacd pymeshlab
 

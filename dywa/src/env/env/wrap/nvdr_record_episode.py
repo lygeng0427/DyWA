@@ -28,6 +28,7 @@ from util.torch_util import dcn
 from util.vis.img import tile_images, to_hwc
 
 import cv2
+import imageio.v2 as imageio
 
 from icecream import ic
 
@@ -92,23 +93,33 @@ class NvdrRecordEpisode(WrapperEnv):
     def action_space(self):
         return self.env.action_space
 
-    def __export_episode(self, images: np.ndarray, count: int, env_id: int = 0):
+    def __export_episode(self, images: np.ndarray, count: int, env_id: int = 0,
+                         subdir: str = '', label: Optional[str] = None):
         if count <= 0:
             return
         out_dir = ensure_directory(
-            self._record_dir /
+            self._record_dir / subdir /
             F'env_{env_id:04d}')
         ic(count)
         # for i in range(count):
         #     cv2.imwrite(F'{out_dir}/{i:04d}.png', images[i])
-        
-        video_path = out_dir / f'episode_{self.eps_count_batch[env_id]:04d}.mp4'
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        height, width = images.shape[1:3]
-        self.video_writer = cv2.VideoWriter(str(video_path), fourcc, self.cfg.video_fps, (width, height))
+
+        # Tag the file with the object key so can/bottle/scale is identifiable.
+        tag = '' if label is None else f'_{label}'
+        video_path = out_dir / f'episode_{self.eps_count_batch[env_id]:04d}{tag}.mp4'
+        # Write H.264/yuv420p directly (via imageio's bundled ffmpeg) so the mp4
+        # plays in browsers / QuickTime / most players. OpenCV inside the
+        # container can only encode 'mp4v', which many players reject.
+        # Frames are RGB (camera color), which is what imageio expects.
+        writer = imageio.get_writer(
+            str(video_path),
+            fps=self.cfg.video_fps,
+            codec='libx264',
+            pixelformat='yuv420p',
+            ffmpeg_params=['-movflags', '+faststart'])
         for frame in images[:count]:
-            self.video_writer.write(frame)
-        self.video_writer.release()
+            writer.append_data(frame)
+        writer.close()
 
         # self.__eps_count += 1
         self.eps_count_batch[env_id] +=1
@@ -153,8 +164,9 @@ class NvdrRecordEpisode(WrapperEnv):
         rgb_imgs_np = to_hwc(rgb_imgs_np)
         done_np = dcn(done)
 
-        # Draw all debug lines on our image as well
-        if True:
+        # Draw all debug lines on our image as well (only when the gym is
+        # wrapped by TrackDebugLines; the raw isaacgym Gym has no `.lines`).
+        if getattr(self.env.gym, 'lines', None):
             vertices, colors, counts = self.__get_lines(self.env.gym.lines)
             vertices = vertices.reshape(self.env.num_env, -1, 3)
             vertices = dcn(self.project(vertices, self.cfg.img_size))
@@ -176,10 +188,18 @@ class NvdrRecordEpisode(WrapperEnv):
                         thickness=1
                     )
 
-        self.__images[self.__index, th.arange(self.env.num_env)] = rgb_imgs_np
-        self.__index += 1
+        # Clamp to the buffer length: an episode that runs the full `timeout`
+        # can otherwise push __index past the (timeout-sized) buffer before the
+        # done resets it.
+        T = self.__images.shape[0]
+        write_idx = np.minimum(self.__index, T - 1)
+        self.__images[write_idx, th.arange(self.env.num_env)] = rgb_imgs_np
+        self.__index = np.minimum(self.__index + 1, T)
 
         # Process episodes.
+        # `both` records successes and failures into separate subdirs
+        # in a single run; `succ`/`fail` keep the original behavior.
+        record_both = (self.cfg.episode_type == 'both')
         sel = None
         if self.cfg.episode_type == 'succ':
             assert (('success' in info))
@@ -187,16 +207,27 @@ class NvdrRecordEpisode(WrapperEnv):
         elif self.cfg.episode_type == 'fail':
             assert (('success' in info))
             sel = ~info['success']
+        elif record_both:
+            assert (('success' in info))
 
         for env_id in np.argwhere(done_np).ravel():
             if self.env.buffers['step'][env_id] < 30:
                 continue
             if (sel is not None) and (not sel[env_id]):
                 continue
+            # Object key for this env (same source as CountCategoricalSuccess).
+            label = None
+            if getattr(self.env.scene, 'cur_names', None) is not None:
+                label = self.env.scene.cur_names[env_id].split('/')[-1]
+            subdir = ''
+            if record_both:
+                subdir = 'succ' if bool(info['success'][env_id]) else 'fail'
             self.__export_episode(
                 self.__images[:, env_id],
                 self.__index[env_id],
-                env_id)
+                env_id,
+                subdir=subdir,
+                label=label)
 
         # Reset counts for completed episodes.
         self.__index[done_np] = 0
