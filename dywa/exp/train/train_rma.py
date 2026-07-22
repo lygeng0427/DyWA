@@ -261,8 +261,8 @@ class DAggerTrainerEnv(WrapperEnv):
         """
         cfg = self.cfg
 
-        self.__next_action = self.last_obs.get('teacher_action')
-        self.__next_student_action, aux = self.student.get_output(self.last_obs)
+        self.__next_action = self.last_obs.get('teacher_action') # torch.Size([1024, 2, 20])
+        self.__next_student_action, aux = self.student.get_output(self.last_obs) # aux: torch.Size([1024, 1, 128])
 
         # Get student's action based on previous state.
         if actions is None:

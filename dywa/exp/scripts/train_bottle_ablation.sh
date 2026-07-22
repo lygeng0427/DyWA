@@ -24,7 +24,7 @@ if [ -z "$VARIANT" ]; then
   echo "usage: $(basename "$0") {full|no_adapt|no_hist_film} [GPU]"; exit 1
 fi
 
-TRAIN_STEP=20000                       # decent for bottle-only (see CLAUDE.md)
+TRAIN_STEP=25000                       # decent for bottle-only (see CLAUDE.md)
 SAVE_STEP=2000                         # checkpoint save frequency (cfg.save_step)
 
 root="/home/user/DyWA/output/bottle_ablation"

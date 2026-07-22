@@ -162,16 +162,16 @@ class FilmBlock(nn.Module):
             returns:
             out : [ batch_size x out_channels]
         '''
-        out = self.blocks[0](x)
-        embed = self.cond_encoder(cond)
+        out = self.blocks[0](x) # torch.Size([1, 2368])
+        embed = self.cond_encoder(cond) # torch.Size([1, 4736])
         if self.cond_predict_scale:
-            embed = embed.reshape(embed.shape[0], 2, self.out_channels)
+            embed = embed.reshape(embed.shape[0], 2, self.out_channels) # torch.Size([1, 2, 2368])
             scale = embed[:,0,...]
             bias = embed[:,1,...]
-            out = scale * out + bias
+            out = scale * out + bias # torch.Size([1, 2368])
         else:
             out = out + embed
-        out = self.blocks[1](out)
+        out = self.blocks[1](out) # torch.Size([1, 2368])
         out = out + self.residual_conv(x)
         return out
     
@@ -386,11 +386,11 @@ class TokenEncoder(nn.Module):
             out,_,_ = self.encoder(input_tokens)
         elif "mlp" in self.cfg.encoder_type:
             cur_shape = input_tokens.shape
-            input_tokens = input_tokens.reshape(*cur_shape[:-2], -1)
-            out = self.encoder(input_tokens)
+            input_tokens = input_tokens.reshape(*cur_shape[:-2], -1) # torch.Size([1, 4096])
+            out = self.encoder(input_tokens) # torch.Size([1, 4096])
             if self.cfg.res_link:
                 out = out + input_tokens
-            out = out.reshape(*cur_shape[:-1], -1)
+            out = out.reshape(*cur_shape[:-1], -1) # torch.Size([1, 32, 128])
         elif self.cfg.encoder_type == "Identity":
             out = input_tokens
         else:
@@ -476,11 +476,11 @@ class TokenDecoder(nn.Module):
             out = out.permute(0, 2, 1)
         elif self.cfg.decoder_type == "film":
             cond = query_tokens.reshape(query_tokens.shape[0], -1)
-            cond = self.decoder[0](cond)
-            x = value_tokens.reshape(*value_tokens.shape[:-2], -1)
+            cond = self.decoder[0](cond) # torch.Size([1, 64])
+            x = value_tokens.reshape(*value_tokens.shape[:-2], -1) # torch.Size([1, 4608])
             for layer in self.decoder[1:]:
                 x = layer(x, cond)
-            out = x.reshape(-1, self.num_query_tokens, self.embed_size)
+            out = x.reshape(-1, self.num_query_tokens, self.embed_size) # torch.Size([1, 37, 128])
 
         elif self.cfg.decoder_type == "Identity":
             if query_tokens is not None:

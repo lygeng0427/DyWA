@@ -317,3 +317,11 @@ output
 *.bak
 backup
 debug
+
+# Diagnostic scripts
+_diag*.py
+_test*.py
+
+# Bars/doors experiment scripts
+*bars*
+*doors*

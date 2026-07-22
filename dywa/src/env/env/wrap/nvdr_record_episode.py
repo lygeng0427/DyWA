@@ -50,6 +50,10 @@ class NvdrRecordEpisode(WrapperEnv):
 
         video_fps: int = 30
 
+        # Cap videos written per subdir ('succ'/'fail', or '' when not 'both').
+        # 0 = unlimited. Bounds disk/time when recording during a long eval.
+        max_per_type: int = 0
+
     def __init__(self, cfg: Config, env: EnvIface, **kwds):
         super().__init__(env)
         self.cfg = cfg
@@ -76,6 +80,8 @@ class NvdrRecordEpisode(WrapperEnv):
 
         # self.__eps_count: int = 0
         self.eps_count_batch: list = [0] * env.num_env
+        # Videos already written per subdir, for the max_per_type cap.
+        self._written_per_type: dict = {}
         # Create a giant buffer for storing images.
         self.__images = np.zeros(
             merge_shapes(env.timeout, env.num_env, cfg.img_size, 3),
@@ -222,6 +228,12 @@ class NvdrRecordEpisode(WrapperEnv):
             subdir = ''
             if record_both:
                 subdir = 'succ' if bool(info['success'][env_id]) else 'fail'
+            # Enforce the per-type cap (0 = unlimited).
+            if self.cfg.max_per_type > 0:
+                if self._written_per_type.get(subdir, 0) >= self.cfg.max_per_type:
+                    continue
+                self._written_per_type[subdir] = \
+                    self._written_per_type.get(subdir, 0) + 1
             self.__export_episode(
                 self.__images[:, env_id],
                 self.__index[env_id],
