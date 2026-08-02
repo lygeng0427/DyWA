@@ -20,10 +20,14 @@ export TTT_ACCUM=${TTT_ACCUM:-32}
 export TTT_SAVE_DIR=${TTT_SAVE_DIR:-/home/user/DyWA/output/ttt/ckpt}
 mkdir -p "$TTT_SAVE_DIR"
 
+# Metrics go to WandB (project=$TTT_WANDB_PROJECT, entity=$TTT_WANDB_ENTITY, run
+# name = the per-run dir e.g. alpha_1_recon5). Override or disable logging with:
+#   TTT_WANDB_PROJECT=... TTT_WANDB_ENTITY=... TTT_WANDB_MODE=online|offline|disabled
+# (`wandb login` once first; use TTT_WANDB_MODE=disabled for quick debug runs).
+
 # Inner-loop step size. Each alpha writes to  $TTT_SAVE_DIR/alpha_<a>/  so an
-# alpha sweep never overwrites itself:
+# alpha sweep never overwrites itself, and each becomes a distinct WandB run:
 #   for a in 0.1 0.5 1.0 2.0; do TTT_ALPHA=$a bash meta_train_ttt.sh 1; done
-# then:  tensorboard --logdir $TTT_SAVE_DIR   (compares all alphas side by side)
 export TTT_ALPHA=${TTT_ALPHA:-1}
 
 # Policy trunk: 'dywa' (TokenDecoder+Aggregator+q_head) or 'film_transformer'

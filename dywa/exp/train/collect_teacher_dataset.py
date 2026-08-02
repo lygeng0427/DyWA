@@ -52,6 +52,7 @@ from train_ppo_arm import (
 )
 from rma_env import setup_rma_env_v2
 from train_rma import Config as RMAConfig, update_net_cfg, get_config_path
+from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
 
 
 # Extra collector knobs are read from the environment to avoid touching the
@@ -110,6 +111,15 @@ def main(cfg: RMAConfig):
     env = setup_rma_env_v2(cfg, env, teacher_agent,
                            state_size=128, is_student=False, dagger=True)
 
+    # Optional per-episode video recording of the teacher rollouts. Enabled with
+    # ++use_nvdr_record_episode=True (see collect_ttt.sh's TTT_RECORD block). The
+    # recorder wraps the stepping env and forwards obs/info unchanged, so the
+    # success gate below is unaffected. Records succ/fail into subdirs when
+    # episode_type=both. NOTE: it allocates a (timeout × num_env × HxW × 3) frame
+    # buffer, so record with a SMALL num_env (≤ ~16), not the 256 default.
+    if cfg.use_nvdr_record_episode:
+        env = NvdrRecordEpisode(cfg.nvdr_record_episode, env, hide_arm=False)
+
     device = env.device
     E = env.num_env
 
@@ -124,6 +134,12 @@ def main(cfg: RMAConfig):
             return [None] * E
 
     per_env = [[] for _ in range(E)]
+    # A done env is reset only inside the NEXT env.step's pre_physics, so the
+    # snapshot taken at the step right after a done still holds the OLD
+    # episode's terminal state (verified bit-identical by
+    # _probe_reset_staleness.py; it corrupted frame 0 of ~90% of episodes with
+    # a teleport-sized pose jump). Drop that one stale record per reset.
+    skip_next = np.zeros(E, dtype=bool)
     dataset = []
     obs = env.reset()
 
@@ -154,15 +170,19 @@ def main(cfg: RMAConfig):
         names = scene_names()
 
         for e in range(E):
-            rec = {k: snap[k][e] for k in snap}
-            rec['partial_cloud_next'] = nxt[e]
-            per_env[e].append(rec)
+            if skip_next[e]:
+                skip_next[e] = False   # stale post-done snapshot — do not store
+            else:
+                rec = {k: snap[k][e] for k in snap}
+                rec['partial_cloud_next'] = nxt[e]
+                per_env[e].append(rec)
 
             if done_np[e]:
                 if succ_np[e] and len(per_env[e]) >= MIN_EP_LEN:
                     dataset.append(_episode_from_steps(per_env[e], names[e]))
                     pbar.update(1)
                 per_env[e] = []
+                skip_next[e] = True
 
         if len(dataset) >= NUM_EPISODES:
             break

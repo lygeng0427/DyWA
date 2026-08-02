@@ -68,13 +68,17 @@ REC_ARGS=()
 if [ "${TTT_RECORD:-0}" = "1" ]; then
   REC_DIR=${TTT_RECORD_DIR:-/home/user/DyWA/output/ttt/videos}
   REC_MAX=${TTT_RECORD_MAX:-6}
+  REC_USE_COL=${TTT_RECORD_USE_COL:-False}   # False => RGB visual mesh
+  REC_GHOST=${TTT_RECORD_GHOST:-True}        # draw object at goal pose
   REC_ARGS=(
     ++use_nvdr_record_episode=True
     ++nvdr_record_episode.episode_type=both
     ++nvdr_record_episode.record_dir=${REC_DIR}
     ++nvdr_record_episode.max_per_type=${REC_MAX}
+    ++nvdr_record_episode.use_col=${REC_USE_COL}
+    ++nvdr_record_episode.draw_goal_ghost=${REC_GHOST}
   )
-  echo "[eval_ttt] recording succ/fail videos -> ${REC_DIR}  (max ${REC_MAX}/type)"
+  echo "[eval_ttt] recording succ/fail videos -> ${REC_DIR}  (max ${REC_MAX}/type, rgb=$([ "${REC_USE_COL}" = "False" ] && echo yes || echo no), goal_ghost=${REC_GHOST})"
 fi
 
 PYTORCH_JIT=0 python3 eval_ttt.py \

@@ -26,6 +26,7 @@ from models.common import merge_shapes
 from util.path import ensure_directory
 from util.torch_util import dcn
 from util.vis.img import tile_images, to_hwc
+from util.math_util import matrix_from_quaternion
 
 import cv2
 import imageio.v2 as imageio
@@ -53,6 +54,18 @@ class NvdrRecordEpisode(WrapperEnv):
         # Cap videos written per subdir ('succ'/'fail', or '' when not 'both').
         # 0 = unlimited. Bounds disk/time when recording during a long eval.
         max_per_type: int = 0
+
+        # Render a translucent "ghost" of the object at its GOAL pose, composited
+        # into every frame of the trajectory. Uses the object's own visual mesh
+        # (respecting `use_col`) placed at `env.task.goal`. The ghost is static
+        # within an episode (goal + camera are fixed), so it is rendered once per
+        # episode and cached, then alpha-blended on top of each frame.
+        draw_goal_ghost: bool = False
+        # Blend weight of the ghost over the base frame (0=invisible, 1=opaque).
+        ghost_alpha: float = 0.45
+        # Optional RGB tint (each in [0,1]) mixed into the ghost so the goal pose
+        # is visually distinct from the real object. None => object's own color.
+        ghost_tint: Optional[Tuple[float, float, float]] = (0.3, 1.0, 0.3)
 
     def __init__(self, cfg: Config, env: EnvIface, **kwds):
         super().__init__(env)
@@ -82,6 +95,15 @@ class NvdrRecordEpisode(WrapperEnv):
         self.eps_count_batch: list = [0] * env.num_env
         # Videos already written per subdir, for the max_per_type cap.
         self._written_per_type: dict = {}
+        # Per-episode cache for the goal-pose ghost (see Config.draw_goal_ghost).
+        # Rendered once per episode; invalidated on each env's `done`.
+        self._ghost_valid = np.zeros((env.num_env,), dtype=bool)
+        self._ghost_rgb = np.zeros(
+            merge_shapes(env.num_env, cfg.img_size, 3), dtype=np.uint8)
+        self._ghost_mask = np.zeros(
+            merge_shapes(env.num_env, cfg.img_size), dtype=bool)
+        # Disabled automatically if the env can't supply a goal / object body.
+        self._ghost_ok = bool(cfg.draw_goal_ghost)
         # Create a giant buffer for storing images.
         self.__images = np.zeros(
             merge_shapes(env.timeout, env.num_env, cfg.img_size, 3),
@@ -158,6 +180,72 @@ class NvdrRecordEpisode(WrapperEnv):
             nss = np.stack(nss, axis=0)
         return (vss, css, nss)
 
+    def _render_ghost_batch(self):
+        """Render the object's visual mesh at its GOAL pose for every env.
+
+        Returns (rgb_uint8 [N,H,W,3], mask_bool [N,H,W]). All non-object bodies
+        are pushed outside the camera frustum so only the object-at-goal is
+        rasterized; the mask is where anything was drawn (the phong ambient floor
+        keeps rendered pixels well above the black background).
+        """
+        env = self.env
+        dev = env.device
+        N = env.num_env
+
+        # Object body row within the per-env body list (DOMAIN_ENV order, which
+        # matches how NvdrCameraWrapper builds body_poses_4x4[:, :num_body]).
+        obj_row = env.scene.obj_body_ids[:, 0].long()          # [N]
+        goal = env.task.goal                                    # [N,7] pose goal
+        g4 = th.eye(4, device=dev, dtype=th.float32).repeat(N, 1, 1)
+        g4[:, :3, 3] = goal[..., :3]
+        if goal.shape[-1] >= 7:
+            quat = goal[..., 3:7]
+        else:
+            # position-only goal: reuse the object's current orientation.
+            quat = env.tensors['root'][env.scene.cur_ids.long(), 3:7]
+        matrix_from_quaternion(quat, g4[:, :3, :3])
+
+        # Ghost body poses: everything far off-screen, object at the goal pose.
+        P = self.img_env.body_poses_4x4.shape[1]
+        ghost = th.eye(4, device=dev, dtype=th.float32).repeat(N, P, 1, 1)
+        ghost[:, :, :3, 3] = 1.0e3                              # beyond z_far
+        ghost[th.arange(N, device=dev), obj_row] = g4
+
+        with th.no_grad():
+            out = self.img_env.cam(ghost)                      # fixed camera
+        color = out['color']                                   # [N,H,W,3] float
+        mask = color.max(dim=-1).values > 0.05
+        color = (255.0 * color.clamp(0.0, 1.0)).to(th.uint8)
+        return dcn(color), dcn(mask)
+
+    def _blend_goal_ghost(self, rgb_imgs_np):
+        """Refresh stale per-env ghosts, then alpha-blend them onto the frame."""
+        if not self._ghost_ok:
+            return rgb_imgs_np
+        invalid = np.argwhere(~self._ghost_valid).ravel()
+        if len(invalid) > 0:
+            try:
+                g_rgb, g_mask = self._render_ghost_batch()
+            except Exception as e:
+                # Missing goal/body or a render failure: disable rather than
+                # crash the (best-effort) recording.
+                print(f'[NvdrRecordEpisode] goal-ghost disabled: {e}')
+                self._ghost_ok = False
+                return rgb_imgs_np
+            self._ghost_rgb[invalid] = g_rgb[invalid]
+            self._ghost_mask[invalid] = g_mask[invalid]
+            self._ghost_valid[invalid] = True
+
+        ghost_rgb = self._ghost_rgb.astype(np.float32)
+        if self.cfg.ghost_tint is not None:
+            tint = np.asarray(self.cfg.ghost_tint, np.float32) * 255.0
+            ghost_rgb = 0.6 * ghost_rgb + 0.4 * tint
+        a = float(self.cfg.ghost_alpha)
+        base = rgb_imgs_np.astype(np.float32)
+        blended = (1.0 - a) * base + a * ghost_rgb
+        m = self._ghost_mask[..., None]
+        return np.where(m, blended, base).astype(np.uint8)
+
     def __record(self, obs, rew, done, info):
         # Render & Query.
         alt = self.img_env._wrap_obs(obs)
@@ -169,6 +257,11 @@ class NvdrRecordEpisode(WrapperEnv):
             rgb_imgs_np = (255 * rgb_imgs_np.clip(0.0, 1.0)).astype(np.uint8)
         rgb_imgs_np = to_hwc(rgb_imgs_np)
         done_np = dcn(done)
+
+        # Composite the goal-pose ghost (cached per episode) onto every frame,
+        # before debug lines so wireframes stay on top of the ghost.
+        if self._ghost_ok:
+            rgb_imgs_np = self._blend_goal_ghost(rgb_imgs_np)
 
         # Draw all debug lines on our image as well (only when the gym is
         # wrapped by TrackDebugLines; the raw isaacgym Gym has no `.lines`).
@@ -243,6 +336,10 @@ class NvdrRecordEpisode(WrapperEnv):
 
         # Reset counts for completed episodes.
         self.__index[done_np] = 0
+        # The goal resamples on reset, so invalidate the ghost cache for envs
+        # that just finished — the next episode re-renders with its new goal.
+        if self._ghost_ok:
+            self._ghost_valid[done_np.astype(bool).reshape(-1)] = False
 
     def step(self, *args, **kwds):
         # Step original env.

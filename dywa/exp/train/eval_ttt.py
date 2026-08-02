@@ -34,8 +34,13 @@ from dataclasses import replace
 # field — that lives on test_rma.py's Config — so read it from the environment
 # instead of cfg. Default matches test_rma.py's test_step=4000.
 TEST_STEP = int(os.environ.get('TTT_TEST_STEP', 4000))
-# Max envs adapted at once inside masked_adapt (bounds point-attention memory).
+# Point-attention working-set bound inside masked_adapt. The full-history buffer
+# can hold up to timeout/K (~60) macro-windows, and masked_adapt runs attention
+# over env_chunk*H windows at once, so a fixed env chunk tuned for H=10 would OOM
+# at H=60. Instead bound the PRODUCT env_chunk*H to ~ADAPT_WINDOW_BUDGET windows
+# (the H=10 default of 16 envs → 160 is known-good), capped by ADAPT_ENV_CHUNK.
 ADAPT_ENV_CHUNK = int(os.environ.get('TTT_ADAPT_ENV_CHUNK', 16))
+ADAPT_WINDOW_BUDGET = int(os.environ.get('TTT_ADAPT_WINDOW_BUDGET', 256))
 
 import torch as th
 from tqdm.auto import tqdm
@@ -106,13 +111,15 @@ def masked_adapt(student, q0E, hc, hmacro, hflow, valid, k, alpha):
     """
     E, H = valid.shape
     # Chunk over envs to bound peak memory: OutcomeEncoder/dyn run point-attention
-    # over E*H clouds of N points at once, and the N×N attention over all E*H=500
-    # windows OOMs at E=50. Each env adapts independently (per-env masked mean +
-    # per-env grad), so splitting E is exact, not an approximation.
-    if E > ADAPT_ENV_CHUNK:
+    # over env_chunk*H clouds of N points at once. Size the env chunk from the H
+    # actually passed so the working set stays ~ADAPT_WINDOW_BUDGET windows (the
+    # full-history H can reach ~60), capped by ADAPT_ENV_CHUNK. Each env adapts
+    # independently (per-env masked mean + per-env grad), so splitting E is exact.
+    env_chunk = min(ADAPT_ENV_CHUNK, max(1, ADAPT_WINDOW_BUDGET // max(H, 1)))
+    if E > env_chunk:
         outs = []
-        for s in range(0, E, ADAPT_ENV_CHUNK):
-            sl = slice(s, min(s + ADAPT_ENV_CHUNK, E))
+        for s in range(0, E, env_chunk):
+            sl = slice(s, min(s + env_chunk, E))
             outs.append(masked_adapt(student, q0E[sl], hc[sl], hmacro[sl],
                                      hflow[sl], valid[sl], k, alpha))
         return th.cat(outs, dim=0)
@@ -180,7 +187,15 @@ def main(cfg: RMAConfig):
     tp = student.cfg.ttt
     Kin = int(tp.k_inner_steps)         # number of inner TTT steps (0 = no-TTT baseline)
     Kw = int(tp.window_k)               # macro-transition stride (outcome window)
-    H = int(tp.history_len)             # max macro-transitions kept
+    H = int(tp.history_len)             # ring capacity ≥ full-episode windows (timeout/Kw)
+    # Full-history TTT: the belief adapts on ALL macro-windows since the episode's
+    # last reset. H must cover the worst case (a FAILED episode runs to timeout),
+    # or the ring wraps mid-episode and silently degrades to a sliding window.
+    max_ep_windows = -(-int(env.timeout) // Kw) if hasattr(env, 'timeout') else H
+    if H < max_ep_windows:
+        print(f"[eval_ttt] WARNING: history_len={H} < timeout/Kw={max_ep_windows}; "
+              f"long episodes will wrap the ring (sliding-window fallback). "
+              f"Raise ++student.ttt.history_len to >= {max_ep_windows}.")
     A = int(student.cfg.action_size)
     D = int(tp.latent_dim)
     n_gains = A - 6
@@ -212,6 +227,12 @@ def main(cfg: RMAConfig):
     blk_hand = th.zeros(E, 9, device=device)
     blk_pose = th.zeros(E, 7, device=device)
     blk_ok = th.zeros(E, dtype=th.bool, device=device)
+    # Envs whose reset is still pending: a done env is reset only inside the
+    # NEXT env.step's pre_physics, so obs / tensors['root'] read before that
+    # step still hold the OLD episode's terminal state (verified bit-identical
+    # by _probe_reset_staleness.py). A window opened from such a snapshot would
+    # span the reset teleport, so it must start masked.
+    stale = th.zeros(E, dtype=th.bool, device=device)
 
     def _build_macro(hee, hmg, hseq):
         return student.build_macro(hee, hmg, hseq)
@@ -219,14 +240,21 @@ def main(cfg: RMAConfig):
     def _adapt_now(cloud_t):
         if Kin <= 0 or not bool(valid.any()):
             return q0E
+        # The ring is sized for the worst-case (failing) episode (timeout/K), but
+        # most episodes fill only a few slots. Restrict to macro-slots valid for
+        # at least one env so dyn/outcome run over the ACTIVE history, not the full
+        # capacity — cheaper, and it keeps env_chunk*H small in masked_adapt.
+        cols = valid.any(dim=0)                              # [H]
         center, scale = frame_of(cloud_t)                    # [E,1,3],[E,1,1]
-        hc = to_frame(hist_c, center, scale)
-        hflow = to_frame_vec(hist_flow, scale)
-        hee = hist_ee.clone()
-        hee[..., :3] = to_frame_vec(hist_ee[..., :3], scale)
-        macro = _build_macro(hee, hist_mg, hist_seq)
+        hc = to_frame(hist_c[:, cols], center, scale)
+        hflow = to_frame_vec(hist_flow[:, cols], scale)
+        hee = hist_ee[:, cols].clone()
+        hee[..., :3] = to_frame_vec(hee[..., :3], scale)
+        hmg = hist_mg[:, cols]
+        hseq = hist_seq[:, cols] if is_seq else None
+        macro = _build_macro(hee, hmg, hseq)
         with th.enable_grad():
-            return masked_adapt(student, q0E, hc, macro, hflow, valid, Kin, tp.ttt_alpha)
+            return masked_adapt(student, q0E, hc, macro, hflow, valid[:, cols], Kin, tp.ttt_alpha)
 
     mode = f'TTT-{Kin}step' if Kin > 0 else 'No-TTT'
     print(f"[eval_ttt] mode={mode}  E={E} H={H} N={N} Kw={Kw} macro={tp.macro_action} alpha={tp.ttt_alpha}")
@@ -240,7 +268,7 @@ def main(cfg: RMAConfig):
             blk_cloud = cloud_t.clone()
             blk_hand = obs['hand_state'].clone()
             blk_pose = raw_obj_pose().clone()
-            blk_ok = th.ones(E, dtype=th.bool, device=device)
+            blk_ok = ~stale        # stale-open snapshot = old episode's terminal state
             act_block.zero_()
             q_cur = _adapt_now(cloud_t)
 
@@ -268,6 +296,9 @@ def main(cfg: RMAConfig):
         if done.any():
             valid[done] = False
             blk_ok[done] = False
+        # the actual reset happens inside the NEXT env.step — until then this
+        # env's obs/pose reads are the old episode's terminal state.
+        stale = done.reshape(-1).to(th.bool)
 
     env.unwrap(target=CountCategoricalSuccess).save()
     print(f"[eval_ttt] done ({mode}); per-object results saved by CountCategoricalSuccess.")

@@ -47,6 +47,33 @@ if [ "${TTT_FIX_PHYS:-0}" = "1" ]; then
   echo "[fix_phys] size=${S}m mass=${M}kg restitution=${R} (object+table friction stay randomized)"
 fi
 
+# Optional per-episode video recording of the teacher rollouts. TTT_RECORD=1
+# saves videos into <record_dir>/{succ,fail}/ (episode_type=both). Videos are
+# RGB-based (use_col=False -> object *visual* mesh, not the collision mesh) and
+# include a translucent ghost of the object at its GOAL pose across the whole
+# trajectory (draw_goal_ghost=True). Recording allocates a large per-env frame
+# buffer, so pair TTT_RECORD=1 with a SMALL TTT_NUM_ENV (e.g. 16).
+REC_ARGS=()
+if [ "${TTT_RECORD:-0}" = "1" ]; then
+  REC_DIR=${TTT_RECORD_DIR:-/home/user/DyWA/output/ttt/collect_videos}
+  REC_MAX=${TTT_RECORD_MAX:-8}
+  REC_TYPE=${TTT_RECORD_TYPE:-both}
+  REC_USE_COL=${TTT_RECORD_USE_COL:-False}   # False => RGB visual mesh
+  REC_GHOST=${TTT_RECORD_GHOST:-True}        # draw object at goal pose
+  REC_ARGS=(
+    ++use_nvdr_record_episode=True
+    ++nvdr_record_episode.episode_type=${REC_TYPE}
+    ++nvdr_record_episode.record_dir=${REC_DIR}
+    ++nvdr_record_episode.max_per_type=${REC_MAX}
+    ++nvdr_record_episode.use_col=${REC_USE_COL}
+    ++nvdr_record_episode.draw_goal_ghost=${REC_GHOST}
+  )
+  echo "[collect_ttt] recording ${REC_TYPE} videos -> ${REC_DIR} (max ${REC_MAX}/type, rgb=$([ "${REC_USE_COL}" = "False" ] && echo yes || echo no), goal_ghost=${REC_GHOST})"
+  if [ "${TTT_NUM_ENV}" -gt 32 ]; then
+    echo "[collect_ttt] WARNING: TTT_NUM_ENV=${TTT_NUM_ENV} is large for recording; consider TTT_NUM_ENV<=16."
+  fi
+fi
+
 PYTORCH_JIT=0 python3 collect_teacher_dataset.py \
   +platform=debug \
   +env=abs_goal_1view \
@@ -58,4 +85,5 @@ PYTORCH_JIT=0 python3 collect_teacher_dataset.py \
   ++icp_obs.icp.ckpt=/home/user/DyWA/ckpts/512-32-balanced-SAM-wd-5e-05-920 \
   ++env.single_object_scene.filter_file=${TTT_FILTER} \
   ++env.num_env=${TTT_NUM_ENV} \
-  "${FIX_PHYS_ARGS[@]}"
+  "${FIX_PHYS_ARGS[@]}" \
+  "${REC_ARGS[@]}"

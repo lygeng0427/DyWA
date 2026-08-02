@@ -322,6 +322,10 @@ debug
 _diag*.py
 _test*.py
 
+diag*.py
+diag*.sh
+_probe*.py
+
 # Bars/doors experiment scripts
 *bars*
 *doors*

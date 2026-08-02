@@ -41,7 +41,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, RandomSampler
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from tqdm.auto import tqdm
 
 from util.hydra_cli import hydra_cli
@@ -73,6 +73,14 @@ STEPS_PER_EPOCH = int(_envs('TTT_STEPS_PER_EPOCH', 10000))
 # push harder against OutcomeEncoder collapse (probes showed eff_rank ~6/64).
 RECON_WEIGHT = float(_envs('TTT_RECON_WEIGHT', 5.0))
 
+# WandB logging (replaces the old TensorBoard SummaryWriter), mirroring
+# ttt_with_dyn_bars.py. Set TTT_WANDB_MODE=disabled for local/debug runs that
+# should not log (parallels the old `+platform=debug` no-wandb behavior);
+# 'offline' logs to disk for later `wandb sync`.
+WANDB_PROJECT = _envs('TTT_WANDB_PROJECT', 'ttt_dywa')
+WANDB_ENTITY = _envs('TTT_WANDB_ENTITY', 'r-pad')
+WANDB_MODE = _envs('TTT_WANDB_MODE', 'online')
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset — flat over (episode, query-step): a length-T successful trajectory
@@ -99,7 +107,7 @@ class TeacherEpisodes(Dataset):
     def __getitem__(self, idx):
         i, t = self.index[idx]
         ep = self.eps[i]
-        K, H = self.K, self.H
+        K = self.K
 
         query_obs = {k: th.as_tensor(np.asarray(ep[k][t], dtype=np.float32))
                      for k in (list(self.state_keys) + ['partial_cloud', 'goal_cloud'])
@@ -107,9 +115,11 @@ class TeacherEpisodes(Dataset):
         teacher_action = th.as_tensor(np.asarray(ep['teacher_action'][t], dtype=np.float32))  # [2, A]
 
         # K-strided macro-transition support windows ending at t, most-recent
-        # first: [t-K, t], [t-2K, t-K], … capped to H windows. Each window `s`
-        # spans steps [s, s+K] (s+K ≤ t ≤ T-1, so all indices are valid).
-        starts = np.asarray(list(range(t - K, -1, -K))[:H], dtype=np.int64)   # [M]
+        # first: [t-K, t], [t-2K, t-K], … back to step 0 — the FULL history, no
+        # sliding cap. Friction is constant within an episode, so every past
+        # window informs the same belief; truncating would discard evidence. Each
+        # window `s` spans steps [s, s+K] (s+K ≤ t ≤ T-1, so all indices valid).
+        starts = np.asarray(list(range(t - K, -1, -K)), dtype=np.int64)       # [M]
         M = len(starts)
         pc = ep['partial_cloud']; hs = ep['hand_state']
         ta = ep['teacher_action']; op = ep['object_pose']
@@ -267,10 +277,32 @@ def main(cfg: RMAConfig):
     run_name += f'_recon{RECON_WEIGHT:g}'
     save_dir = os.path.join(SAVE_DIR, run_name)
     os.makedirs(save_dir, exist_ok=True)
-    tb_dir = os.environ.get('TTT_TB', os.path.join(save_dir, 'tb'))
-    writer = SummaryWriter(tb_dir)
     print(f"ttt_alpha={alpha:g}  policy_trunk={trunk}  ->  ckpt dir: {save_dir}")
-    print(f"tensorboard logdir: {tb_dir}")
+
+    tp_cfg = cfg.student.ttt
+    wandb.init(
+        project=WANDB_PROJECT, name=run_name, entity=(WANDB_ENTITY or None),
+        mode=WANDB_MODE, dir=save_dir,
+        config={
+            'epochs': EPOCHS, 'accum': ACCUM, 'end_dropout': END_DROPOUT,
+            'train_ratio': TRAIN_RATIO, 'steps_per_epoch': STEPS_PER_EPOCH,
+            'query_stride': QUERY_STRIDE, 'seed': SEED,
+            'ttt_alpha': alpha, 'policy_trunk': trunk,
+            'recon_weight': RECON_WEIGHT,
+            'window_k': int(tp_cfg.window_k),
+            'macro_action': str(tp_cfg.macro_action),
+            'latent_dim': int(tp_cfg.latent_dim),
+            'k_inner_steps': int(tp_cfg.k_inner_steps),
+            'detach_q': bool(tp_cfg.detach_q),
+        })
+    # Two logging cadences: per-optimizer-step train metrics (x=gstep) vs
+    # per-epoch val metrics (x=epoch). define_metric ties each to its own axis.
+    wandb.define_metric('gstep')
+    wandb.define_metric('epoch')
+    wandb.define_metric('train/*', step_metric='gstep')
+    wandb.define_metric('val/*', step_metric='epoch')
+    wandb.define_metric('epoch/*', step_metric='epoch')
+    print(f"wandb: project={WANDB_PROJECT} entity={WANDB_ENTITY} run={run_name} mode={WANDB_MODE}")
 
     with open(DATA_PATH, 'rb') as f:
         episodes = pickle.load(f)
@@ -346,8 +378,9 @@ def main(cfg: RMAConfig):
                 nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
                 opt.step()
                 opt.zero_grad()
-                writer.add_scalar('train/kl', win / ACCUM, gstep)
-                writer.add_scalar('train/recon', win_recon / ACCUM, gstep)
+                wandb.log({'train/kl': win / ACCUM,
+                           'train/recon': win_recon / ACCUM,
+                           'gstep': gstep})
                 gstep += 1; n_acc += 1; win = 0.0; win_recon = 0.0
 
         # flush the remainder
@@ -362,17 +395,19 @@ def main(cfg: RMAConfig):
               f"| val_pre={val_pre:.4f} val_post={val_post:.4f} gap={val_pre-val_post:+.4f} "
               f"| q_move={val_qmove:.4f} pre_rand={val_rand:.4f} "
               f"| inner {val_in_pre:.4f}->{val_in_post:.4f} ({val_in_pre-val_in_post:+.4f})")
-        writer.add_scalar('train/kl_epoch', train_kl, epoch)
-        writer.add_scalar('val/pre', val_pre, epoch)
-        writer.add_scalar('val/post', val_post, epoch)
-        writer.add_scalar('val/gap_pre_minus_post', val_pre - val_post, epoch)  # >0 = TTT helps
-        writer.add_scalar('val/q_move', val_qmove, epoch)          # ‖q_post-q0‖
-        writer.add_scalar('val/pre_rand', val_rand, epoch)         # loss at random belief
-        writer.add_scalar('val/inner_pre', val_in_pre, epoch)       # inner objective @ q0
-        writer.add_scalar('val/inner_post', val_in_post, epoch)     # inner objective @ q_post
-        # >0 = the inner step actually descends its own objective
-        writer.add_scalar('val/inner_gap_pre_minus_post', val_in_pre - val_in_post, epoch)
-        writer.flush()
+        wandb.log({
+            'epoch': epoch,
+            'epoch/train_kl': train_kl,
+            'val/pre': val_pre,
+            'val/post': val_post,
+            'val/gap_pre_minus_post': val_pre - val_post,        # >0 = TTT helps
+            'val/q_move': val_qmove,                             # ‖q_post-q0‖
+            'val/pre_rand': val_rand,                            # loss at random belief
+            'val/inner_pre': val_in_pre,                         # inner objective @ q0
+            'val/inner_post': val_in_post,                       # inner objective @ q_post
+            # >0 = the inner step actually descends its own objective
+            'val/inner_gap_pre_minus_post': val_in_pre - val_in_post,
+        })
 
         student.save(os.path.join(save_dir, 'latest.ckpt'))
         if val_post < best_post:
@@ -384,7 +419,7 @@ def main(cfg: RMAConfig):
             student.save(os.path.join(save_dir, 'best_gap.ckpt'))
             print(f"  [*] best_gap (val_pre-val_post={best_gap:+.4f})")
 
-    writer.close()
+    wandb.finish()
     print("Meta-training complete.")
 
 

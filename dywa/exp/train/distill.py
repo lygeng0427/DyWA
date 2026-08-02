@@ -52,7 +52,9 @@ class TTTParams:
     latent_dim: int = 64      # belief dim D; == decoder FiLM cond_dim
     ttt_alpha: float = 0.5    # inner-loop step size
     k_inner_steps: int = 1    # number of inner TTT steps
-    history_len: int = 10     # max macro-transitions kept for adaptation
+    history_len: int = 64     # macro-transition buffer capacity (≈ full episode:
+                              # timeout/window_k, e.g. 300/5=60). NOT a sliding-window
+                              # cap — TTT adapts on the FULL history since episode start.
     detach_q: bool = False    # False=second-order (offline), True=first-order (online)
     d_model: int = 128
     nhead: int = 4
