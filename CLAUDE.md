@@ -73,6 +73,76 @@ All entry scripts are in `dywa/exp/train/` and the shell wrappers in `dywa/exp/s
 
 See `dywa/exp/train/README.md` for the full walkthrough and CLI option reference.
 
+## TTT (test-time training) pipeline
+
+A separate three-stage pipeline that replaces the RMA feed-forward `cond` with a latent
+belief `q` adapted by gradient descent at test time. Entry points:
+`collect_teacher_dataset.py` → `meta_train_ttt.py` → `eval_ttt.py`, wrapped by
+`collect_ttt.sh` / `meta_train_ttt.sh` / `eval_ttt.sh`. All commands run **inside the
+container**; the trailing integer is the GPU index (`eval_ttt.sh` takes `<k_inner_steps>
+[GPU]`).
+
+**One bottle** (`bottle_one.json`, 1 object — friction is the only hidden variable, so
+`TTT_FIX_PHYS=1` pins scale/mass/restitution):
+
+```bash
+# 1. collect
+TTT_FIX_PHYS=1 TTT_FILTER=/input/DGN/bottle_one.json \
+TTT_NUM_EPISODES=50 TTT_MAX_STEPS=40000 \
+TTT_OUT=/home/user/DyWA/output/ttt/dataset_one_bottle.pkl \
+bash dywa/exp/scripts/collect_ttt.sh 0
+
+# 2. meta-train  (-> ckpt_one_bottle/film_transformer_alpha_0.5_recon5/)
+TTT_DATA=/home/user/DyWA/output/ttt/dataset_one_bottle.pkl \
+TTT_SAVE_DIR=/home/user/DyWA/output/ttt/ckpt_one_bottle \
+TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=0.5 TTT_RECON_WEIGHT=5 \
+bash dywa/exp/scripts/meta_train_ttt.sh 0
+
+# 3. eval sweep (k=0 is the no-TTT baseline)
+for K in 0 1 2 5; do
+  TTT_SAVE_DIR=/home/user/DyWA/output/ttt/ckpt_one_bottle \
+  TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=0.5 TTT_RECON_WEIGHT=5 \
+  TTT_FIX_PHYS=1 TTT_FILTER=/input/DGN/bottle_one.json TTT_NUM_ENV=60 \
+  bash dywa/exp/scripts/eval_ttt.sh $K 0
+done
+```
+
+**All bottles** (train on `bottle_train.json` = 19 bottles, eval on the held-out
+`bottle_test.json` = 5; full DR, no `TTT_FIX_PHYS`). These are the script defaults for
+data/ckpt/filter paths, so only the trunk/alpha need setting:
+
+```bash
+# 1. collect  (-> output/ttt/dataset_ttt_teacher.pkl)
+bash dywa/exp/scripts/collect_ttt.sh 0
+
+# 2. meta-train  (-> output/ttt/ckpt/film_transformer_alpha_1_recon5/)
+TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=1 TTT_RECON_WEIGHT=5 \
+bash dywa/exp/scripts/meta_train_ttt.sh 0
+
+# 3. eval sweep on the held-out bottles
+for K in 0 1 2 5; do
+  TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=1 TTT_RECON_WEIGHT=5 \
+  bash dywa/exp/scripts/eval_ttt.sh $K 0
+done
+```
+
+Gotchas, all of which fail *silently*:
+
+- `{TTT_POLICY_TRUNK, TTT_ALPHA, TTT_RECON_WEIGHT}` are what compose the run-dir name, so
+  they select the checkpoint at eval and **must match meta-training**. A trunk mismatch
+  loads nothing under `strict=False` and leaves the whole policy random (`eval_ttt.py`'s
+  `_assert_ckpt_covers_policy` catches it — unless you bypass it with `TTT_STUDENT_CKPT=`).
+- `TTT_FIX_PHYS` must match between collect and eval, or the student is evaluated on a
+  different dynamics distribution than it was trained on.
+- Success metric is `val_pre − val_post > 0` during meta-training (printed per epoch, and
+  logged to WandB; `TTT_WANDB_MODE=disabled` to turn logging off). Eval success rates are
+  printed to stdout — every `k` overwrites the same file under `output/test_rma/`.
+- A done env is reset in the **next** `env.step`'s `pre_physics`, so obs/`tensors['root']`
+  read after a done step still hold the old episode's terminal state. Both the collector
+  and `eval_ttt.py` compensate (`skip_next` / `blk_ok = ~stale`); any new code that
+  snapshots state across an episode boundary must do the same, or windows spanning the
+  reset teleport poison the belief. `_probe_reset_staleness.py` verifies this.
+
 ## Hydra configuration model
 
 Runs are configured entirely through Hydra. Config groups live under `dywa/src/data/cfg/`

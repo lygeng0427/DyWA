@@ -35,6 +35,7 @@ Project website: [https://pku-epic.github.io/DyWA/](https://pku-epic.github.io/D
   - 1.3 [Assets Setup](#13-assets-setup)
 - 2 [Policy Training](#2-policy-training)
 - 3 [Policy Evaluation](#3-policy-evaluation)
+- 4 [Test-Time Training (TTT)](#4-test-time-training-ttt)
 
 ## 1. Setup
 > Note: We highly recommand users with docker setup.
@@ -152,6 +153,84 @@ Instead, adjust the number of parallel environment by changing `++env.num_env=${
 
 For detailed setup or troubleshooting, please refer to [README](./dywa/exp/train/README.md).
 
+## 4. Test-Time Training (TTT)
+
+An experimental extension that replaces the feed-forward RMA adaptation module with a latent
+belief `q` that is **adapted by gradient descent at test time** against a learned dynamics
+model. The pipeline has three stages — collect a teacher-rollout dataset, meta-train the
+belief/policy offline, then roll out with per-env adaptation:
+
+| stage | entry point | wrapper |
+|---|---|---|
+| 1. collect | `dywa/exp/train/collect_teacher_dataset.py` | `dywa/exp/scripts/collect_ttt.sh [GPU]` |
+| 2. meta-train | `dywa/exp/train/meta_train_ttt.py` | `dywa/exp/scripts/meta_train_ttt.sh [GPU]` |
+| 3. evaluate | `dywa/exp/train/eval_ttt.py` | `dywa/exp/scripts/eval_ttt.sh <k_inner_steps> [GPU]` |
+
+All commands run **inside the docker container**. `k_inner_steps=0` is the no-TTT baseline.
+Both variants below need a pretrained teacher (`++load_ckpt`, set inside the scripts).
+
+### Single-object setting
+
+Trains and evaluates on one bottle (`/input/DGN/bottle_one.json`). `TTT_FIX_PHYS=1` pins
+scale, mass and restitution so that **friction is the only hidden dynamics variable** the
+belief could adapt to:
+
+```bash
+# 1. collect 50 successful teacher trajectories
+TTT_FIX_PHYS=1 TTT_FILTER=/input/DGN/bottle_one.json \
+TTT_NUM_EPISODES=50 TTT_MAX_STEPS=40000 \
+TTT_OUT=/home/user/DyWA/output/ttt/dataset_one_bottle.pkl \
+bash dywa/exp/scripts/collect_ttt.sh 0
+
+# 2. meta-train the belief + policy
+TTT_DATA=/home/user/DyWA/output/ttt/dataset_one_bottle.pkl \
+TTT_SAVE_DIR=/home/user/DyWA/output/ttt/ckpt_one_bottle \
+TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=0.5 TTT_RECON_WEIGHT=5 \
+bash dywa/exp/scripts/meta_train_ttt.sh 0
+
+# 3. sweep the number of inner TTT steps
+for K in 0 1 2 5; do
+  TTT_SAVE_DIR=/home/user/DyWA/output/ttt/ckpt_one_bottle \
+  TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=0.5 TTT_RECON_WEIGHT=5 \
+  TTT_FIX_PHYS=1 TTT_FILTER=/input/DGN/bottle_one.json TTT_NUM_ENV=60 \
+  bash dywa/exp/scripts/eval_ttt.sh $K 0
+done
+```
+
+### Multi-object setting
+
+Trains on 19 bottles (`/input/DGN/bottle_train.json`) and evaluates on 5 held-out ones
+(`/input/DGN/bottle_test.json`) under full domain randomization. These paths are the script
+defaults, so only the trunk and step size need to be given:
+
+```bash
+# 1. collect  ->  output/ttt/dataset_ttt_teacher.pkl
+bash dywa/exp/scripts/collect_ttt.sh 0
+
+# 2. meta-train  ->  output/ttt/ckpt/film_transformer_alpha_1_recon5/
+TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=1 TTT_RECON_WEIGHT=5 \
+bash dywa/exp/scripts/meta_train_ttt.sh 0
+
+# 3. evaluate on the held-out bottles
+for K in 0 1 2 5; do
+  TTT_POLICY_TRUNK=film_transformer TTT_ALPHA=1 TTT_RECON_WEIGHT=5 \
+  bash dywa/exp/scripts/eval_ttt.sh $K 0
+done
+```
+
+### Notes
+
+- **`TTT_POLICY_TRUNK`, `TTT_ALPHA` and `TTT_RECON_WEIGHT` compose the checkpoint directory
+  name**, so the values passed at evaluation must match those used for meta-training —
+  otherwise the checkpoint is not found and the policy stays randomly initialised.
+- **`TTT_FIX_PHYS` must match between collection and evaluation**, or the student is
+  evaluated on a different dynamics distribution than it was trained on.
+- Meta-training prints `val_pre` / `val_post` per epoch; `val_post < val_pre` is the signal
+  that adaptation is helping. Metrics are logged to WandB (`TTT_WANDB_MODE=disabled` to
+  turn this off). Checkpoints: `best.ckpt`, `best_gap.ckpt`, `latest.ckpt`.
+- Evaluation prints `Global average success rate` to stdout; each `k_inner_steps` run
+  overwrites the same per-object result file under `output/test_rma/`, so read the rate
+  from each run's own output.
 
 ## Citation
 
