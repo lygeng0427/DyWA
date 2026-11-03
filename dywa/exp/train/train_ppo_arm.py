@@ -360,7 +360,14 @@ class Config(WandbConfig, HfConfig, GroupConfig, ConfigBase):
         if self.global_device is not None:
             dev_id: int = int(str(self.global_device).split(':')[-1])
             self.env = recursive_replace_map(self.env, {
-                'graphics_device_id': (dev_id if self.env.use_viewer else -1),
+                # graphics_device_id=-1 is headless: Isaac Gym then refuses to
+                # create ANY camera sensor (create_camera_sensor -> -1), which
+                # WithCamera reports only as a downstream "could not find camera
+                # with handle -1" error. The nvdr/raycast cameras don't need
+                # this, but use_isaac_camera does.
+                'graphics_device_id': (dev_id if (self.env.use_viewer
+                                                  or self.env.use_isaac_camera)
+                                       else -1),
                 'compute_device_id': dev_id,
                 'th_device': self.global_device,
             })

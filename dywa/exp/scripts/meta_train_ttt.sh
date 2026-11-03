@@ -35,7 +35,23 @@ export TTT_ALPHA=${TTT_ALPHA:-1}
 #   for t in dywa film_transformer; do TTT_POLICY_TRUNK=$t bash meta_train_ttt.sh 1; done
 export TTT_POLICY_TRUNK=${TTT_POLICY_TRUNK:-dywa}
 
+# 3D RoPE (axis-split, Q/K only) in OutcomeEncoder / DynamicsModel /
+# TransformerPointEncoder. TTT_ROPE=1 turns it on; the run dir then gains a
+# _rope<omega_max> suffix (parameter-free => the ckpt assert cannot catch a
+# rope mismatch, so the name is the only guard). A/B it with:
+#   for r in 0 1; do TTT_ROPE=$r bash meta_train_ttt.sh 1; done
+TTT_ROPE=${TTT_ROPE:-0}
+TTT_ROPE_OMEGA_MIN=${TTT_ROPE_OMEGA_MIN:-0.4}
+TTT_ROPE_OMEGA_MAX=${TTT_ROPE_OMEGA_MAX:-30}
+ROPE_ARGS=(
+  ++student.ttt.rope=$([ "${TTT_ROPE}" = "1" ] && echo True || echo False)
+  ++student.ttt.rope_omega_min=${TTT_ROPE_OMEGA_MIN}
+  ++student.ttt.rope_omega_max=${TTT_ROPE_OMEGA_MAX}
+)
+[ "${TTT_ROPE}" = "1" ] && echo "[meta_train_ttt] 3D RoPE ON (omega ${TTT_ROPE_OMEGA_MIN}..${TTT_ROPE_OMEGA_MAX})"
+
 PYTORCH_JIT=0 python3 meta_train_ttt.py \
+  "${ROPE_ARGS[@]}" \
   +platform=debug \
   +env=abs_goal_1view \
   +run=teacher_base \

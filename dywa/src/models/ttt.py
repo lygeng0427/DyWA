@@ -52,6 +52,96 @@ OUTCOME_LAYERS = 2
 # exactly what trips the CUDACachingAllocator assert under expandable_segments.
 USE_CHECKPOINT = False
 
+# 3D RoPE frequency band, in the units the clouds are actually handed to these
+# modules in — i.e. AFTER `to_frame` (shared-frame, query-radius units). See
+# `RoPE3D` for why this is a band and not LitePT's base-`b` form.
+ROPE_OMEGA_MIN = 0.4
+ROPE_OMEGA_MAX = 30.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0. 3D rotary position embedding (RoPE) for point attention.
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_rope(x, cos, sin):
+    """Rotate adjacent feature pairs of `x` by the per-point angles `(cos, sin)`.
+
+    x        : `[B, nhead, N, d_head]`      (d_head even)
+    cos, sin : `[B, 1, N, d_head // 2]`     (broadcast over heads)
+
+    Pure elementwise mul/add, so it is double-backward safe (invariant #1) and
+    adds no parameters.
+    """
+    xp = x.reshape(*x.shape[:-1], -1, 2)
+    x0, x1 = xp[..., 0], xp[..., 1]
+    out = th.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
+    return out.reshape(x.shape)
+
+
+class RoPE3D(nn.Module):
+    """Axis-split 3D rotary position embedding, applied to Q/K only (V untouched).
+
+    This is LitePT's `PointROPE` (arXiv 2512.13689, Eqs. 3–4) with two
+    adaptations forced by this codebase; see `_plan_rope.md` §3.
+
+    **Frequency band, not a base.** LitePT feeds raw voxel grid indices (order
+    1e2–1e3), where `theta_p = b**(-2p/d)` with `b=100` yields multi-turn phases.
+    Our clouds are O(1) after `to_frame`, so that same formula would make every
+    rotation near-identity and RoPE a no-op. Measured over two teacher datasets:
+    support clouds span ~3.8 normalized units (they live in the *query's* frame,
+    so the extent includes the object's travel) at ~0.023 point spacing, giving
+        omega_min <~ pi / (2 * 3.8) ~ 0.4     (slowest pair does not wrap)
+        omega_max <~ pi / 0.023     ~ 130     (fastest pair does not alias)
+    so frequencies are laid out geometrically across `[omega_min, omega_max]`.
+    Because `to_frame` divides by the query's radius, one band is valid for every
+    object scale (invariant #3 works in RoPE's favour here).
+
+    **Cyclic axis interleave, not contiguous thirds.** `d_head` is 128/4 = 32 = 16
+    rotation pairs, and 16 is not divisible by 3. Pair `p` takes axis `p % 3`, so
+    no `d_model` change is needed and each axis still receives frequencies spread
+    across the whole band rather than one contiguous sixth of it.
+
+    Buffers are non-persistent: RoPE adds **no `state_dict` keys**, so old
+    checkpoints keep loading — which is exactly why the rope flag must appear in
+    the run name (`_plan_rope.md` §3.5); `_assert_ckpt_covers_policy` cannot see
+    a rope-on/rope-off mismatch.
+    """
+
+    def __init__(self, d_head: int,
+                 omega_min: float = ROPE_OMEGA_MIN,
+                 omega_max: float = ROPE_OMEGA_MAX):
+        super().__init__()
+        assert d_head % 2 == 0, f"RoPE needs an even d_head (got {d_head})"
+        P = d_head // 2
+        axis = th.arange(P) % 3                       # cyclic interleave
+        theta = th.empty(P, dtype=th.float32)
+        for a in range(3):
+            sel = (axis == a).nonzero(as_tuple=True)[0]
+            n = len(sel)
+            if n == 0:
+                continue
+            # geometric spread over the band, per axis
+            j = (th.arange(n, dtype=th.float32) / (n - 1)) if n > 1 else th.zeros(1)
+            theta[sel] = omega_max * (omega_min / omega_max) ** j
+        self.d_head = d_head
+        self.omega_min, self.omega_max = omega_min, omega_max
+        self.register_buffer('axis', axis, persistent=False)
+        self.register_buffer('theta', theta, persistent=False)
+
+    def forward(self, pos: th.Tensor, n_prefix: int = 0):
+        """`pos [B, N, 3]` → `(cos, sin)`, each `[B, 1, N, d_head//2]`.
+
+        `n_prefix` prepends identity rotations (cos=1, sin=0) for leading tokens
+        that carry no 3D position — `TransformerPointEncoder`'s learnable summary
+        tokens, whose sequence is `T+N` long while `pos` is only `N`.
+        """
+        ang = pos[..., self.axis] * self.theta        # [B, N, P]
+        cos, sin = th.cos(ang), th.sin(ang)
+        if n_prefix > 0:
+            pad = (*cos.shape[:-2], n_prefix, cos.shape[-1])
+            cos = th.cat([cos.new_ones(pad), cos], dim=-2)
+            sin = th.cat([sin.new_zeros(pad), sin], dim=-2)
+        return cos.unsqueeze(-3), sin.unsqueeze(-3)   # broadcast over heads
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Attention blocks — manual matmul/softmax so double backward works.
@@ -93,11 +183,15 @@ class FiLMTransformerBlock(nn.Module):
         nn.init.xavier_normal_(self.film.weight, gain=0.5)
         nn.init.zeros_(self.film.bias)
 
-    def _attn(self, x):
+    def _attn(self, x, cos=None, sin=None):
         B, N, D = x.shape
         qkv = self.qkv(x)
         qkv = qkv.view(B, N, 3, self.nhead, self.d_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+        if cos is not None:
+            # RoPE on Q/K after the head split, before the score matmul; V is
+            # left alone so the content path is untouched.
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scores = th.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -105,9 +199,9 @@ class FiLMTransformerBlock(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out_dropout(self.attn_out(out))
 
-    def _forward_impl(self, x, cond):
+    def _forward_impl(self, x, cond, cos=None, sin=None):
         h = self.ln1(x)
-        x = x + self._attn(h)
+        x = x + self._attn(h, cos, sin)
 
         h = self.ln2(x)
         h = self.ffn(h)
@@ -119,10 +213,12 @@ class FiLMTransformerBlock(nn.Module):
         x = x + h
         return x
 
-    def forward(self, x, cond):
+    def forward(self, x, cond, rope=None):
+        cos, sin = rope if rope is not None else (None, None)
         if self.use_checkpoint and self.training:
-            return checkpoint(self._forward_impl, x, cond, use_reentrant=False)
-        return self._forward_impl(x, cond)
+            return checkpoint(self._forward_impl, x, cond, cos, sin,
+                              use_reentrant=False)
+        return self._forward_impl(x, cond, cos, sin)
 
 
 class SelfAttnBlock(nn.Module):
@@ -152,11 +248,13 @@ class SelfAttnBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def _attn(self, x):
+    def _attn(self, x, cos=None, sin=None):
         B, N, D = x.shape
         qkv = self.qkv(x)
         qkv = qkv.view(B, N, 3, self.nhead, self.d_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+        if cos is not None:
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scores = th.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -164,15 +262,16 @@ class SelfAttnBlock(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out_dropout(self.attn_out(out))
 
-    def _forward_impl(self, x):
-        x = x + self._attn(self.ln1(x))
+    def _forward_impl(self, x, cos=None, sin=None):
+        x = x + self._attn(self.ln1(x), cos, sin)
         x = x + self.ffn(self.ln2(x))
         return x
 
-    def forward(self, x):
+    def forward(self, x, rope=None):
+        cos, sin = rope if rope is not None else (None, None)
         if self.use_checkpoint and self.training:
-            return checkpoint(self._forward_impl, x, use_reentrant=False)
-        return self._forward_impl(x)
+            return checkpoint(self._forward_impl, x, cos, sin, use_reentrant=False)
+        return self._forward_impl(x, cos, sin)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,11 +315,14 @@ class FlowContentAttnBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def _attn(self, x_qk, x_v):
+    def _attn(self, x_qk, x_v, cos=None, sin=None):
         B, N, D = x_qk.shape
         q = self.q_proj(x_qk).view(B, N, self.nhead, self.d_head).transpose(1, 2)
         k = self.k_proj(x_qk).view(B, N, self.nhead, self.d_head).transpose(1, 2)
         v = self.v_proj(x_v).view(B, N, self.nhead, self.d_head).transpose(1, 2)
+        if cos is not None:
+            # Only the Q/K (position) stream rotates; V carries flow content.
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scores = th.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -228,18 +330,20 @@ class FlowContentAttnBlock(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out_dropout(self.attn_out(out))
 
-    def _forward_impl(self, x_qk, x_v):
+    def _forward_impl(self, x_qk, x_v, cos=None, sin=None):
         # Residual stream tracks the content (V) path; the position stream only
         # routes attention. Pooled output is thus a function of V's (flow).
-        h = self._attn(self.ln1_qk(x_qk), self.ln1_v(x_v))
+        h = self._attn(self.ln1_qk(x_qk), self.ln1_v(x_v), cos, sin)
         x = x_v + h
         x = x + self.ffn(self.ln2(x))
         return x
 
-    def forward(self, x_qk, x_v):
+    def forward(self, x_qk, x_v, rope=None):
+        cos, sin = rope if rope is not None else (None, None)
         if self.use_checkpoint and self.training:
-            return checkpoint(self._forward_impl, x_qk, x_v, use_reentrant=False)
-        return self._forward_impl(x_qk, x_v)
+            return checkpoint(self._forward_impl, x_qk, x_v, cos, sin,
+                              use_reentrant=False)
+        return self._forward_impl(x_qk, x_v, cos, sin)
 
 
 class OutcomeEncoder(nn.Module):
@@ -251,10 +355,20 @@ class OutcomeEncoder(nn.Module):
     """
 
     def __init__(self, d_model=D_MODEL, nhead=NHEAD, num_layers=OUTCOME_LAYERS,
-                 latent_dim=LATENT_DIM, use_checkpoint=USE_CHECKPOINT):
+                 latent_dim=LATENT_DIM, use_checkpoint=USE_CHECKPOINT,
+                 rope=False, rope_omega_min=ROPE_OMEGA_MIN,
+                 rope_omega_max=ROPE_OMEGA_MAX):
         super().__init__()
         self.flow_embed = nn.Linear(3, d_model)     # content
         self.pcd_embed = nn.Linear(3, d_model)      # position
+        # RoPE (if on) is ADDITIVE to `pcd_embed`, never a replacement: RoPE makes
+        # attention scores translation-invariant, and in the shared frame the
+        # absolute cloud position IS the object's displacement across windows
+        # (invariant #3). Dropping `pcd_embed` here is the worst case — this
+        # block's residual stream is `x_v` (flow only), so position would then
+        # survive nowhere. See `_plan_rope.md` §3.2.
+        self.rope = (RoPE3D(d_model // nhead, rope_omega_min, rope_omega_max)
+                     if rope else None)
         self.first_block = FlowContentAttnBlock(
             d_model=d_model, nhead=nhead, use_checkpoint=use_checkpoint)
         self.rest_blocks = nn.ModuleList([
@@ -269,11 +383,16 @@ class OutcomeEncoder(nn.Module):
 
     def forward(self, pcd, flow):
         pcd_after = pcd + flow
+        # Phases are derived HERE from the cloud this module already receives, so
+        # no call site changes — the inner-loop forward is written out four times
+        # (ttt_inner_update, meta_train's _adapt/_inner_loss, eval's masked_adapt)
+        # and threading (cos,sin) from callers would silently desync them.
+        rope = self.rope(pcd_after) if self.rope is not None else None
         flow_feat = self.flow_embed(flow)           # content → V
         pcd_feat = self.pcd_embed(pcd_after)        # position → Q/K
-        x = self.first_block(flow_feat + pcd_feat, flow_feat)
+        x = self.first_block(flow_feat + pcd_feat, flow_feat, rope)
         for blk in self.rest_blocks:
-            x = blk(x)
+            x = blk(x, rope)
         x = self.final_ln(x)
         return self.proj(x.mean(dim=1))
 
@@ -323,11 +442,20 @@ class TransformerPointEncoder(nn.Module):
     """
 
     def __init__(self, num_tokens, embed_size, num_layers=3, nhead=4,
-                 use_checkpoint=False, eps=1e-6):
+                 use_checkpoint=False, eps=1e-6,
+                 rope=False, rope_omega_min=ROPE_OMEGA_MIN,
+                 rope_omega_max=ROPE_OMEGA_MAX):
         super().__init__()
         self.num_tokens = num_tokens
         self.eps = eps
         self.embed = nn.Linear(3, embed_size)
+        # NOTE: unlike the outcome/dynamics path, this encoder normalizes
+        # PER-CLOUD (max radius = 1), so the cloud spans ~1 unit rather than the
+        # ~3.8 a support cloud spans in the query's frame. The slow end of the
+        # band is therefore under-used here; harmless (it costs one pair per
+        # axis), but it is why the band is a config knob and not a constant.
+        self.rope = (RoPE3D(embed_size // nhead, rope_omega_min, rope_omega_max)
+                     if rope else None)
         self.global_embed = nn.Linear(4, embed_size)          # [center(3) ‖ scale(1)]
         self.summary = nn.Parameter(th.randn(num_tokens, embed_size) * 0.02)
         self.blocks = nn.ModuleList([
@@ -345,8 +473,12 @@ class TransformerPointEncoder(nn.Module):
         g = self.global_embed(th.cat([center.squeeze(1), scale], dim=-1))  # [B,D]
         summ = self.summary.unsqueeze(0).expand(B, -1, -1) + g.unsqueeze(1)  # [B,T,D]
         h = th.cat([summ, x], dim=1)                                      # [B,T+N,D]
+        # The summary tokens carry no 3D position, so they get identity rotation
+        # (n_prefix); the sequence is T+N long while `cloud_n` is only N.
+        rope = (self.rope(cloud_n, n_prefix=self.num_tokens)
+                if self.rope is not None else None)
         for blk in self.blocks:
-            h = blk(h)
+            h = blk(h, rope)
         return self.final_ln(h[:, :self.num_tokens])                     # [B,T,D]
 
 
@@ -475,14 +607,20 @@ class DynamicsModel(nn.Module):
 
     def __init__(self, latent_dim=LATENT_DIM, action_dim=20, pos_dim=3,
                  d_model=D_MODEL, num_layers=DYN_LAYERS, nhead=NHEAD,
-                 use_checkpoint=USE_CHECKPOINT):
+                 use_checkpoint=USE_CHECKPOINT,
+                 rope=False, rope_omega_min=ROPE_OMEGA_MIN,
+                 rope_omega_max=ROPE_OMEGA_MAX):
         super().__init__()
         self.action_dim = action_dim
         self.pos_dim = pos_dim
         self.latent_dim = latent_dim
 
         # per-point input: [cloud(3) ‖ macro-action broadcast(action_dim)]
+        # `cloud` stays in the embedding (absolute position = object displacement
+        # in the shared frame); RoPE only adds relative structure to the scores.
         self.embed = nn.Linear(3 + action_dim, d_model)
+        self.rope = (RoPE3D(d_model // nhead, rope_omega_min, rope_omega_max)
+                     if rope else None)
         # FiLM conditions on q alone (see class docstring).
         self.cond_dim = latent_dim
         self.blocks = nn.ModuleList([
@@ -501,9 +639,10 @@ class DynamicsModel(nn.Module):
         act_bc = action.unsqueeze(1).expand(B, N, self.action_dim)   # [B, N, A]
         per_point = th.cat([cloud, act_bc], dim=-1)                  # [B, N, 3+A]
 
+        rope = self.rope(cloud) if self.rope is not None else None
         x = self.embed(per_point)
         for blk in self.blocks:
-            x = blk(x, q)                                # FiLM on q alone
+            x = blk(x, q, rope)                          # FiLM on q alone
         x = self.final_ln(x)
         return self.latent_head(x.mean(dim=1))
 

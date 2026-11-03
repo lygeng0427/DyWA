@@ -15,6 +15,7 @@ from pathlib import Path
 from gym import spaces
 import trimesh
 
+import os
 import numpy as np
 import torch as th
 
@@ -1504,8 +1505,13 @@ class CountCategoricalSuccess(WrapperEnv):
     def __init__(self, env: EnvIface):
         super().__init__(env)
         sets = '-'.join(env.scene.cfg.base_set)
+        # TTT_RESULT_TAG separates result dirs across otherwise-identical evals
+        # (e.g. the friction-varying vs mass-varying pipelines, which share
+        # base_set='dgn' and would otherwise overwrite each other's results).
+        tag = os.environ.get('TTT_RESULT_TAG', '')
+        sub = f'{sets}-{tag}' if tag else sets
         self._save_dir: Path = ensure_directory(
-            f'/home/user/DyWA/output/test_rma/dywa/result/{sets}')
+            f'/home/user/DyWA/output/test_rma/dywa/result/{sub}')
         self.counting = {}
 
     def reset(self):

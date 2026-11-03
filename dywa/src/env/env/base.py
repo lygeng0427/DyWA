@@ -293,9 +293,9 @@ class EnvBase(EnvIface):
         self.step_idx = 0
         
         if cfg.use_isaac_camera:
-            self.isaac_camera.save_img_p0.start()
-            self.isaac_camera.save_img_p1.start()
-            self.isaac_camera.save_img_p2.start()
+            # no-op when isaac_camera.enable_save_img_mp is off; the old
+            # unconditional save_img_pN.start() raised AttributeError there.
+            self.isaac_camera.start_writers()
 
         if cfg.use_traj_recorder:
             self.traj_recorder = TrajRecorder(self.num_env)

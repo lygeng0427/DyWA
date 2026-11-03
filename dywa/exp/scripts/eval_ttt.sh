@@ -36,6 +36,24 @@ else
   RUN_NAME="${TTT_POLICY_TRUNK}_alpha_${TTT_ALPHA}"
 fi
 RUN_NAME="${RUN_NAME}_recon${TTT_RECON_WEIGHT}"
+# 3D RoPE. MUST match meta-training: it is parameter-free, so a rope-on ckpt
+# loaded into a rope-off student passes `_assert_ckpt_covers_policy` silently
+# and evaluates a differently-wired network. The run-dir suffix is the guard —
+# keep this block identical to meta_train_ttt.py's run_name construction.
+# Write these as python's %g renders them ("30", not "30.0"), since the run dir
+# is built here in bash but by f'{...:g}' in meta_train_ttt.py.
+TTT_ROPE=${TTT_ROPE:-0}
+TTT_ROPE_OMEGA_MIN=${TTT_ROPE_OMEGA_MIN:-0.4}
+TTT_ROPE_OMEGA_MAX=${TTT_ROPE_OMEGA_MAX:-30}
+ROPE_ARGS=(
+  ++student.ttt.rope=$([ "${TTT_ROPE}" = "1" ] && echo True || echo False)
+  ++student.ttt.rope_omega_min=${TTT_ROPE_OMEGA_MIN}
+  ++student.ttt.rope_omega_max=${TTT_ROPE_OMEGA_MAX}
+)
+if [ "${TTT_ROPE}" = "1" ]; then
+  RUN_NAME="${RUN_NAME}_rope${TTT_ROPE_OMEGA_MIN}-${TTT_ROPE_OMEGA_MAX}"
+  echo "[eval_ttt] 3D RoPE ON (omega ${TTT_ROPE_OMEGA_MIN}..${TTT_ROPE_OMEGA_MAX})"
+fi
 # Checkpoint base dir. MUST match TTT_SAVE_DIR used by meta_train_ttt.sh, since
 # run_name encodes only {trunk,alpha,recon} — not the object set. A single-bottle
 # run trained into a distinct TTT_SAVE_DIR is found by setting the same var here.
@@ -100,6 +118,7 @@ PYTORCH_JIT=0 python3 eval_ttt.py \
   ++env.single_object_scene.filter_file=${TTT_FILTER} \
   ++env.single_object_scene.mode=valid \
   ++env.num_env=${TTT_NUM_ENV} \
+  "${ROPE_ARGS[@]}" \
   "${FIX_PHYS_ARGS[@]}" \
   "${REC_ARGS[@]}"
 # NOTE: eval_ttt.py tallies per-object success via CountCategoricalSuccess

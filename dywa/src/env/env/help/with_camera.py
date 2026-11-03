@@ -20,6 +20,7 @@ from gym import spaces
 import nvtx
 import cv2, os
 from multiprocessing import Process, Queue, Event
+from queue import Empty as QueueEmpty
 
 def wrap_flow_tensor(gym_tensor, offsets=None, counts=None):
     data = gym_tensor.data_ptr
@@ -121,23 +122,54 @@ class WithCamera:
             k: self.space_maps[k] for k in self.KEYS if self.use_maps[k]
         })
 
+        # NOTE: always define these so callers can start/stop unconditionally;
+        # they stay None when enable_save_img_mp is off.
+        self.save_img_stop_event = None
+        self.save_img_queue0 = self.save_img_queue1 = self.save_img_queue2 = None
+        self.save_img_p0 = self.save_img_p1 = self.save_img_p2 = None
         if cfg.enable_save_img_mp:
             self.save_img_stop_event = Event()
+            # daemon=True is load-bearing: multiprocessing's atexit handler
+            # JOINS non-daemon children, and these workers block forever on an
+            # empty queue, so a non-daemon writer wedges interpreter shutdown
+            # indefinitely (observed: a 15-min run that never exited).
             self.save_img_queue0 = Queue()
-            self.save_img_p0 = Process(target=self.save_images_mp, 
+            self.save_img_p0 = Process(target=self.save_images_mp, daemon=True,
                                     args=(self.save_img_queue0, self.save_img_stop_event))
             self.save_img_queue1 = Queue()
-            self.save_img_p1 = Process(target=self.save_images_mp, 
+            self.save_img_p1 = Process(target=self.save_images_mp, daemon=True,
                                     args=(self.save_img_queue1, self.save_img_stop_event))
             self.save_img_queue2 = Queue()
-            self.save_img_p2 = Process(target=self.save_images_mp, 
+            self.save_img_p2 = Process(target=self.save_images_mp, daemon=True,
                                     args=(self.save_img_queue2, self.save_img_stop_event))
-    
+
+    def start_writers(self):
+        """Start the image-writer processes, if any. No-op when
+        enable_save_img_mp is off (the Process objects are then None)."""
+        for p in (self.save_img_p0, self.save_img_p1, self.save_img_p2):
+            if p is not None:
+                p.start()
+
+    def stop_writers(self, timeout: float = 2.0):
+        """Signal the writers to drain and exit. Safe to call more than once."""
+        if self.save_img_stop_event is not None:
+            self.save_img_stop_event.set()
+        for p in (self.save_img_p0, self.save_img_p1, self.save_img_p2):
+            if p is not None and p.is_alive():
+                p.join(timeout)
+                if p.is_alive():
+                    p.terminate()
+
     ###@nvtx.annotate("WithCamera.save_images_mp()")
     @staticmethod
     def save_images_mp(queue, stop_event):
+        # A bare blocking get() can never observe stop_event once the queue
+        # goes quiet; poll with a timeout so shutdown is actually possible.
         while not stop_event.is_set():
-            img, dir = queue.get()  # block=True  
+            try:
+                img, dir = queue.get(timeout=0.5)
+            except QueueEmpty:
+                continue
             try:
                 cv2.imwrite(dir, img)
             except Exception as e:
@@ -227,6 +259,17 @@ class WithCamera:
                       rot: Tuple[float,...] = (0, 0, 0, 1)):
         cfg = self.cfg
         camera = gym.create_camera_sensor(env, self.prop)
+        if camera is None or camera < 0:
+            # Isaac Gym returns -1 when the sim has no graphics device
+            # (create_sim with graphics_device_id=-1). Fail here, where the
+            # cause is nameable; otherwise it surfaces much later as a "could
+            # not find camera with handle -1" log line and then a th.stack
+            # TypeError on a list of Nones.
+            raise RuntimeError(
+                "create_camera_sensor returned -1: this sim has no graphics "
+                "device. Isaac Gym camera sensors require graphics_device_id "
+                ">= 0 -- see train_ppo_arm.py, which forces -1 unless "
+                "use_viewer or use_isaac_camera is set.")
         x, y, z = pos
         z_offset = envs.scene.table_dims[0, 2]
         x_offset = (envs.scene.table_pos[0, 0] - 
@@ -357,6 +400,14 @@ class WithCamera:
 
         cfg = self.cfg
 
+        # Nothing to do when image dumping is off, or when there is no colour
+        # buffer to dump. Previously this ran unconditionally (base.py calls it
+        # every step), so save_images=False did not actually disable anything
+        # and use_color=False raised KeyError.
+        if (not cfg.save_images) or (self.buffers.get('color') is None):
+            self.step_idx += 1
+            return {'dir': [], 'img': []}
+
         if image_tensors == None:
             camera_rgba_tensor = self.buffers['color'] # 'color': (n_cams*n_envs,H,W,4), 'depth': (n_cams*n_envs,H,W,1)
             camera_depth_tensor = self.buffers['depth']
@@ -398,12 +449,19 @@ class WithCamera:
                 rgb_filename2 = F"/tmp/docker/record_rgb_cam/cam_2/{self.step_idx:04d}.png" 
                 #cv2.imwrite(rgb_filename2,rgb_img2)
             
-            image_lists['dir'].append(rgb_filename0)
-            image_lists['img'].append(rgb_img0)
-            image_lists['dir'].append(rgb_filename1)
-            image_lists['img'].append(rgb_img1)
-            image_lists['dir'].append(rgb_filename2)
-            image_lists['img'].append(rgb_img2)
+            # Only append cameras that actually exist -- appending
+            # rgb_filename1/2 unconditionally raised NameError whenever
+            # enable_cam1/enable_cam2 were off, which is why this class
+            # effectively required all three cameras.
+            if cfg.enable_cam0:
+                image_lists['dir'].append(rgb_filename0)
+                image_lists['img'].append(rgb_img0)
+            if cfg.enable_cam1:
+                image_lists['dir'].append(rgb_filename1)
+                image_lists['img'].append(rgb_img1)
+            if cfg.enable_cam2:
+                image_lists['dir'].append(rgb_filename2)
+                image_lists['img'].append(rgb_img2)
 
             #t2 = time.time()
             #print(f'Saving images cost {t2-t1} secs.')
@@ -412,14 +470,12 @@ class WithCamera:
         return image_lists
 
     def enqueue_images_mp(self, image_lists):
+        queues = [q for q in (self.save_img_queue0,
+                              self.save_img_queue1,
+                              self.save_img_queue2) if q is not None]
+        if not queues:
+            return
         imgs = image_lists.get('img', [])
         dirs = image_lists.get('dir', [])
-        i = 0
-        for img, dir in zip(imgs, dirs):
-            if(i%3==0): 
-                self.save_img_queue0.put((img, dir))
-            elif(i%3==1):
-                self.save_img_queue1.put((img, dir))
-            else:
-                self.save_img_queue2.put((img, dir))
-            i+=1
+        for i, (img, dir) in enumerate(zip(imgs, dirs)):
+            queues[i % len(queues)].put((img, dir))

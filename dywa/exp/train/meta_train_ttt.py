@@ -275,6 +275,15 @@ def main(cfg: RMAConfig):
     # and `load(..., strict=False)` would silently leave one random.)
     run_name = f'alpha_{alpha:g}' if trunk == 'dywa' else f'{trunk}_alpha_{alpha:g}'
     run_name += f'_recon{RECON_WEIGHT:g}'
+    # RoPE MUST be in the run dir. It is parameter-free, so it adds no state_dict
+    # keys and `_assert_ckpt_covers_policy` cannot catch a rope-on ckpt evaluated
+    # with rope off — the same silent-failure class as a policy_trunk mismatch.
+    # BOTH band ends go in the name: the band lives in the config, not the ckpt
+    # (RoPE3D's buffers are non-persistent), so two different bands are two
+    # different networks that would otherwise share a directory.
+    if bool(cfg.student.ttt.rope):
+        run_name += (f'_rope{float(cfg.student.ttt.rope_omega_min):g}'
+                     f'-{float(cfg.student.ttt.rope_omega_max):g}')
     save_dir = os.path.join(SAVE_DIR, run_name)
     os.makedirs(save_dir, exist_ok=True)
     print(f"ttt_alpha={alpha:g}  policy_trunk={trunk}  ->  ckpt dir: {save_dir}")
@@ -294,6 +303,9 @@ def main(cfg: RMAConfig):
             'latent_dim': int(tp_cfg.latent_dim),
             'k_inner_steps': int(tp_cfg.k_inner_steps),
             'detach_q': bool(tp_cfg.detach_q),
+            'rope': bool(tp_cfg.rope),
+            'rope_omega_min': float(tp_cfg.rope_omega_min),
+            'rope_omega_max': float(tp_cfg.rope_omega_max),
         })
     # Two logging cadences: per-optimizer-step train metrics (x=gstep) vs
     # per-epoch val metrics (x=epoch). define_metric ties each to its own axis.

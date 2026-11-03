@@ -83,6 +83,18 @@ class TTTParams:
     macro_embed_dim: int = 32       # macro-action width when macro_action=='seq'
     recon_weight: float = 1.0       # FlowDecoder reconstruction loss weight (anti-collapse)
     recon_on_history: bool = True   # also apply recon on the H support transitions
+    # ── 3D RoPE (see models/ttt.py:RoPE3D and _plan_rope.md) ─────────────────
+    # Axis-split rotary position embedding on Q/K in OutcomeEncoder /
+    # DynamicsModel / TransformerPointEncoder. Parameter-free, so it adds NO
+    # state_dict keys — `_assert_ckpt_covers_policy` therefore cannot detect a
+    # rope-on/rope-off mismatch, which is why `rope` is part of the run name.
+    rope: bool = False
+    # Frequency band in shared-frame (query-radius) units, NOT LitePT's base-`b`
+    # form: our coords are O(1) where theirs are raw grid indices of order 1e2-1e3.
+    # Measured bounds: support clouds span ~3.8 units at ~0.023 point spacing =>
+    # omega_min <~ 0.4 (no wrap), omega_max <~ 130 (no aliasing).
+    rope_omega_min: float = 0.4
+    rope_omega_max: float = 30.0
 
 class StudentAgentRMA(nn.Module):
     '''
@@ -673,13 +685,16 @@ class StudentAgentTTT(StudentAgentRMA):
         else:
             raise ValueError(f"unknown macro_action={tp.macro_action!r}")
 
+        rope_kw = dict(rope=tp.rope, rope_omega_min=tp.rope_omega_min,
+                       rope_omega_max=tp.rope_omega_max)
         self.dyn = DynamicsModel(
             latent_dim=tp.latent_dim, action_dim=self.macro_dim,
             d_model=tp.d_model, num_layers=tp.dyn_layers, nhead=tp.nhead,
-            use_checkpoint=tp.use_checkpoint).to(device)
+            use_checkpoint=tp.use_checkpoint, **rope_kw).to(device)
         self.outcome_enc = OutcomeEncoder(
             d_model=tp.d_model, nhead=tp.nhead, num_layers=tp.outcome_layers,
-            latent_dim=tp.latent_dim, use_checkpoint=tp.use_checkpoint).to(device)
+            latent_dim=tp.latent_dim, use_checkpoint=tp.use_checkpoint,
+            **rope_kw).to(device)
         # Anti-collapse: reconstruct per-point flow from (pcd+flow, z). Outer-loop only.
         self.flow_decoder = FlowDecoder(
             latent_dim=tp.latent_dim, hidden=tp.d_model).to(device)
@@ -700,7 +715,8 @@ class StudentAgentTTT(StudentAgentRMA):
                 embed_size=cfg.embed_size,
                 num_layers=tp.point_enc_layers,
                 nhead=tp.nhead,
-                use_checkpoint=False).to(device)  # policy is outer-loop only (single backward)
+                use_checkpoint=False,  # policy is outer-loop only (single backward)
+                **rope_kw).to(device)
 
         # Direct belief->action path (doors parity). The TokenDecoder FiLM is the
         # *only* other route from `q` to the output, and it is a dead end from a

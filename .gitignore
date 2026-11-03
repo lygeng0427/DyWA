@@ -329,3 +329,24 @@ _probe*.py
 # Bars/doors experiment scripts
 *bars*
 *doors*
+
+# Reference-only external checkouts (each has its own .git)
+third_party/
+# ── Shelved: free per-episode latent TTT for track prediction (2026-09-21) ───
+# Those entry points now live in the out-of-repo archive, so only the reports
+# they produced are listed here.
+#
+# NOT ignored, and deliberately so: models/fric/latent_model.py. It was part of
+# the shelved arm but `LatentTrackModel` is now the INNER model of the joint
+# action+track policy, imported by train_meta_policy.py, eval_meta_policy.py,
+# eval_rollout_policy.py, train_meta_stream.py and train_meta_track.py. Ignoring
+# it would commit a tree that cannot run its own pipeline.
+
+# ── Working notes and experiment reports (kept on disk, out of the repo) ─────
+# Narrative write-ups of finished experiments. The durable conclusions live in
+# CLAUDE.md; these are the long-form working copies behind them.
+LATENT_TTT_REPORT.md
+STREAM_REPORT.md
+META_TTT_REPORT.md
+META_TRACK_PIPELINE_REVIEW.md
+_plan_*.md
